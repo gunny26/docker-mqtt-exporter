@@ -1,0 +1,19 @@
+version: '2.4'
+
+services:
+
+    mqtt-exporter:
+        image: ghcr.io/gunny26/docker-mqtt-exporter:latest
+        container_name: mqtt-exporter
+        restart: unless-stopped
+        environment:
+            TZ: Europe/Vienna
+            MQTT_HOST: 192.168.1.254
+            MQTT_PORT: 1883
+            MQTT_CLIENT_ID: homie-to-prometheus
+            MQTT_CLIENT_SECRET: secret
+            DEBUG_LEVEL: DEBUG
+        mem_limit: 32m
+        cpu_count: 1
+        ports:
+            - 9200:9100/tcp
