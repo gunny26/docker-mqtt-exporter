@@ -1,5 +1,5 @@
 # Multi-stage build for smaller final image
-FROM alpine:3.20 AS builder
+FROM alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -15,12 +15,11 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy and install Python dependencies
-COPY ./build/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --disable-pip-version-check paho-mqtt prometheus_client
 
 
 # Final stage
-FROM alpine:3.20
+FROM alpine
 
 # Set timezone
 ENV TZ=Europe/Vienna
