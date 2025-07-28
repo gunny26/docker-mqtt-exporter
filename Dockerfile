@@ -1,5 +1,5 @@
 # Multi-stage build for smaller final image
-FROM alpine AS builder
+FROM alpine:3.20 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir --disable-pip-version-check paho-mqtt prometheus_
 
 
 # Final stage
-FROM alpine
+FROM alpine:3.20
 
 # Set timezone
 ENV TZ=Europe/Vienna
@@ -48,7 +48,7 @@ WORKDIR /app
 COPY --chown=appuser:appuser build/main.py ./main.py
 
 # Switch to non-root user
-# USER appuser
+USER appuser
 
 # Add healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
