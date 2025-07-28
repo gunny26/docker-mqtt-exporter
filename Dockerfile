@@ -24,11 +24,9 @@ FROM alpine:3.20
 # Set timezone
 ENV TZ=Europe/Vienna
 
-# Install only runtime dependencies
+# Install only runtime dependencies (without Python packages - they're in venv)
 RUN apk add --no-cache \
     python3 \
-    py3-prometheus-client \
-    py3-paho-mqtt \
     tzdata \
     curl \
     ca-certificates \
