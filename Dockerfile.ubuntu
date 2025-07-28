@@ -1,14 +1,15 @@
 # Multi-stage build for smaller final image
-FROM alpine:3.20 AS builder
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Vienna
 
 # Install build dependencies
-RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    py3-virtualenv \
-    gcc \
-    musl-dev \
-    python3-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    python3-setuptools \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create virtual environment
 RUN python3 -m venv /opt/venv
@@ -19,38 +20,34 @@ COPY ./build/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements.txt
 
 # Final stage
-FROM alpine:3.20
+FROM ubuntu:24.04
 
-# Set timezone
+ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Europe/Vienna
 
 # Install only runtime dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
-    py3-prometheus-client \
-    py3-paho-mqtt \
+    python3-prometheus-client \
+    python3-paho-mqtt \
     tzdata \
     curl \
     ca-certificates \
-    && ln -sf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Copy virtual environment from builder stage
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Create non-root user (Alpine doesn't have ubuntu user)
-RUN addgroup -g 1000 appuser && \
-    adduser -u 1000 -G appuser -D -h /app appuser
-
-# Set working directory
+# Set working directory and create it
 WORKDIR /app
 
 # Copy application files with correct ownership
-COPY --chown=appuser:appuser build/main.py ./main.py
+COPY --chown=ubuntu:ubuntu build/main.py ./main.py
 
-# Switch to non-root user
-USER appuser
+# Switch to non-root user (ubuntu user already exists with UID 1000)
+USER ubuntu
 
 # Add healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
