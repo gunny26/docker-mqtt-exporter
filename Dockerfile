@@ -16,7 +16,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy and install Python dependencies
 COPY ./build/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements.txt
+RUN pip install --no-cache-dir --disable-pip-version-check paho-mqtt prometheus_client
+
 
 # Final stage
 FROM alpine:3.20
