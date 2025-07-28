@@ -48,7 +48,7 @@ WORKDIR /app
 COPY --chown=appuser:appuser build/main.py ./main.py
 
 # Switch to non-root user
-USER appuser
+# USER appuser
 
 # Add healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
