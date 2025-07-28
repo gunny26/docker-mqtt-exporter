@@ -1,124 +1,212 @@
 #!/usr/bin/python3
 """
-program to read data from Mosquitto Server and export to prometheus
+MQTT to Prometheus Exporter
+Reads IoT data from MQTT broker and exports metrics for Prometheus.
 """
 import json
 import logging
 import os
+import signal
+import sys
 import time
-# non std modules
+from typing import Optional
+
 import paho.mqtt.client as mqtt
-# import paho.mqtt.subscribe as subscribe
 from prometheus_client import start_http_server, Gauge, Counter
 
 
-logging.basicConfig(level=logging.INFO)
-logging.info("showing enviroment variables")
-logging.info(json.dumps(dict(os.environ), indent=2))
-
-
+# Configuration from environment
 MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1833"))
-MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"]  # mandatory
-MQTT_CLIENT_SECRET = os.environ["MQTT_CLIENT_SECRET"]  # mandatory
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))  # Fixed typo: 1833 -> 1883
+MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"]
+MQTT_CLIENT_SECRET = os.environ["MQTT_CLIENT_SECRET"]
+MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", "60"))
+MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "homie/#")
 DEBUG_LEVEL = os.environ.get("DEBUG_LEVEL", "INFO")
-PROM_EXPORTER_PORT = 9100  # fixed to make HEALTHCHECK working
+PROM_EXPORTER_PORT = int(os.environ.get("PROMETHEUS_PORT", "9100"))
 
-class MyCounter(Counter):
-    """ counter class with set method """
+# Setup logging
+logging.basicConfig(
+    level=getattr(logging, DEBUG_LEVEL),
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
+# Global state
+running = True
+client = None
+
+
+class CounterWithSet(Counter):
+    """Counter class with set method for total energy values"""
+    
     def set(self, value: float) -> None:
-        """Set gauge to the given value."""
+        """Set counter to the given value (for total counters)"""
         self._raise_if_not_observable()
         self._value.set(float(value))
 
-metrics = {
-    "homie_property_temperature": Gauge('homie_property_temperature', 'Temperature in degree celcius', ["device", "node"]),
-    "homie_property_humidity": Gauge('homie_property_humidity', 'Humidity in percent', ["device", "node"]),
-    "homie_property_light": Gauge("homie_property_light", "Light strength in lumen", ["device", "node"]),
-    "homie_property_energy5": Gauge("homie_property_energy5", "Energy consumption last five 5min", ["device", "node"]),
-    "homie_property_energyhour": Gauge("homie_property_energyhour", "Energy consumption last hour", ["device", "node"]),
-    "homie_property_totalenergy": Gauge("homie_property_totalenergy", "Energy consumption total", ["device", "node"]),
-    "homie_property_energy": MyCounter("homie_property_energy", "S0 impulses", ["device", "node"]),
+
+# Prometheus metrics
+METRICS = {
+    "temperature": Gauge('homie_property_temperature', 'Temperature in °C', ["device", "node"]),
+    "humidity": Gauge('homie_property_humidity', 'Humidity in %', ["device", "node"]),
+    "light": Gauge("homie_property_light", "Light strength in lumen", ["device", "node"]),
+    "energy5": Gauge("homie_property_energy5", "Energy consumption last 5min in Wh", ["device", "node"]),
+    "energyhour": Gauge("homie_property_energyhour", "Energy consumption last hour in Wh", ["device", "node"]),
+    "totalenergy": Gauge("homie_property_totalenergy", "Energy consumption total in Wh", ["device", "node"]),
+    "energy": CounterWithSet("homie_property_energy", "S0 impulses total", ["device", "node"]),
 }
 
+# Additional monitoring metrics
+mqtt_messages_received = Counter('mqtt_messages_received_total', 'Total MQTT messages received')
+mqtt_messages_processed = Counter('mqtt_messages_processed_total', 'Total MQTT messages processed successfully')
+mqtt_messages_errors = Counter('mqtt_messages_errors_total', 'Total MQTT message processing errors')
+mqtt_connection_status = Gauge('mqtt_connection_status', 'MQTT connection status (1=connected, 0=disconnected)')
 
-# The callback for when the client receives a CONNACK response from the server.
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global running, client
+    logger.info(f"Received signal {signum}, shutting down...")
+    running = False
+    if client:
+        client.disconnect()
+
+
 def on_connect(client, userdata, flags, rc):
-    """
-    called on connect
-
-    :param client: reference to MQTT client
-    :param userdata: dont know
-    :param flag: dont know
-    :param rc: dont know
-    """
-    logging.info("Connected with result code {rc}")
-    # Subscribing in on_connect() means that if we lose the connection and
-    # reconnect then subscriptions will be renewed.
-    topic = "/".join(("homie", "#"))
-    logging.info(f"subscribing to topic {topic}")
-    client.subscribe(topic)
+    """Callback for MQTT connection"""
+    if rc == 0:
+        logger.info("Successfully connected to MQTT broker")
+        mqtt_connection_status.set(1)
+        
+        # Subscribe to topic
+        logger.info(f"Subscribing to topic: {MQTT_TOPIC}")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        logger.error(f"Failed to connect to MQTT broker, return code: {rc}")
+        mqtt_connection_status.set(0)
 
 
-# The callback for when a PUBLISH message is received from the server.
+def on_disconnect(client, userdata, rc):
+    """Callback for MQTT disconnection"""
+    logger.warning(f"Disconnected from MQTT broker, return code: {rc}")
+    mqtt_connection_status.set(0)
+
+
 def on_message(client, userdata, msg):
-    """
-    called on every message
-
-    :param client: reference to MQTT Client
-    :param userdata: dont know
-    :param msg: topic and payload information
-    """
+    """Callback for received MQTT messages"""
+    mqtt_messages_received.inc()
+    
     try:
-        logging.debug(f"{msg.topic} : {msg.retain} : {msg.payload.decode('utf-8')}")
-        # on first there are some retained messages
-        if not msg.retain:
-            logging.debug(msg.topic)
-            _, device, node, prop = msg.topic.split("/")
-            value = msg.payload.decode("utf-8")
-            if node[0] != "$":  # some status data from homie
-                # {"timestamp": 1629144200, "device": "e166bf00", "node": "ky018", "property": "light", "value": -0.00976563}
-                metric_name = f'homie_property_{prop}'
-                if metrics.get(metric_name):
-                    logging.info(f"exporting {metric_name} = {value}")
-                    metrics[metric_name].labels(device, node).set(float(value))
-                else:
-                    logging.info("UNDEFINED METRIC : {metric_name}")
-                    logging.info(f"homie_property_{prop}(device='{device}', node='{node}') {float(value)}")
+        topic = msg.topic
+        payload = msg.payload.decode('utf-8')
+        
+        logger.debug(f"Received: {topic} = {payload} (retained: {msg.retain})")
+        
+        # Skip retained messages to avoid processing old data
+        if msg.retain:
+            logger.debug(f"Skipping retained message: {topic}")
+            return
+        
+        # Parse homie topic structure: homie/device/node/property
+        topic_parts = topic.split("/")
+        if len(topic_parts) != 4 or topic_parts[0] != "homie":
+            logger.debug(f"Ignoring non-homie topic: {topic}")
+            return
+        
+        _, device, node, prop = topic_parts
+        
+        # Skip homie status messages (starting with $)
+        if node.startswith("$") or prop.startswith("$"):
+            logger.debug(f"Skipping homie status message: {topic}")
+            return
+        
+        # Process metric
+        if prop in METRICS:
+            try:
+                value = float(payload)
+                METRICS[prop].labels(device=device, node=node).set(value)
+                mqtt_messages_processed.inc()
+                logger.debug(f"Updated metric {prop}(device='{device}', node='{node}') = {value}")
+            except ValueError as e:
+                logger.warning(f"Invalid numeric value '{payload}' for {topic}: {e}")
+                mqtt_messages_errors.inc()
         else:
-            logging.debug(f"skipping {msg.topic}")
-    except Exception as exc:
-        logging.exception(exc)
+            logger.debug(f"Unknown property '{prop}' for topic: {topic}")
+            # You could add dynamic metric creation here if needed
+    
+    except Exception as e:
+        logger.error(f"Error processing message {msg.topic}: {e}")
+        mqtt_messages_errors.inc()
+
+
+def create_mqtt_client() -> mqtt.Client:
+    """Create and configure MQTT client"""
+    client = mqtt.Client(client_id=f"{MQTT_CLIENT_ID}_{int(time.time())}")
+    
+    # Set authentication
+    if MQTT_CLIENT_ID and MQTT_CLIENT_SECRET:
+        client.username_pw_set(MQTT_CLIENT_ID, MQTT_CLIENT_SECRET)
+    
+    # Set callbacks
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    
+    return client
 
 
 def main():
-    # some consts
-    if MQTT_CLIENT_ID and MQTT_CLIENT_SECRET:
-        auth = {
-            "username": MQTT_CLIENT_ID,
-            "password": MQTT_CLIENT_SECRET
-        }
+    """Main application loop"""
+    global running, client
+    
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    logger.info("Starting MQTT to Prometheus Exporter")
+    logger.info(f"MQTT Broker: {MQTT_HOST}:{MQTT_PORT}")
+    logger.info(f"Prometheus Port: {PROM_EXPORTER_PORT}")
+    logger.info(f"MQTT Topic: {MQTT_TOPIC}")
+    
+    # Start Prometheus HTTP server
     start_http_server(PROM_EXPORTER_PORT)
-    while True:
-        client = mqtt.Client()
-        client.on_connect = on_connect
-        client.on_message = on_message
-        client.connect(MQTT_HOST, MQTT_PORT, 60)
-        # Blocking call that processes network traffic, dispatches callbacks and
-        # handles reconnecting.
-        # Other loop*() functions are available that give a threaded interface and a
-        # manual interface.
-        client.loop_forever()
-        logging.error("forever loop ended, trying reconnect in 5 s")
-        time.sleep(5)
+    
+    while running:
+        try:
+            # Create MQTT client
+            client = create_mqtt_client()
+            
+            logger.info(f"Connecting to MQTT broker {MQTT_HOST}:{MQTT_PORT}")
+            client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
+            
+            # Start MQTT loop
+            client.loop_forever()
+            
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt")
+            break
+        except Exception as e:
+            logger.error(f"MQTT connection error: {e}")
+            mqtt_connection_status.set(0)
+            
+            if running:
+                logger.info("Reconnecting in 5 seconds...")
+                time.sleep(5)
+    
+    # Cleanup
+    if client:
+        client.disconnect()
+    
+    logger.info("Exporter shutdown complete")
 
 
 if __name__ == "__main__":
-    if DEBUG_LEVEL == "DEBUG":
-        logging.getLogger().setLevel(logging.DEBUG)
-    elif DEBUG_LEVEL == "INFO":
-        logging.getLogger().setLevel(logging.INFO)
-    elif DEBUG_LEVEL == "ERROR":
-        logging.getLogger().setLevel(logging.ERROR)
-    main()
+    try:
+        main()
+    except KeyError as e:
+        logger.error(f"Missing required environment variable: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
